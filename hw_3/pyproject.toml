@@ -1,0 +1,17 @@
+[project]
+name = "mlops-hw3"
+version = "0.1.0"
+
+description = "MLOPS-26, homework 3: OpenOrca + DVC + validation + contamination control"
+
+requires-python = ">=3.12"
+
+dependencies = [
+    "dvc>=3.55",
+    "datasets>=3.0",
+    "pyarrow>=17.0",
+    "pandas>=2.2",
+    "pydantic>=2.9",
+    "datasketch>=1.6",
+    "pyyaml>=6.0",
+]
