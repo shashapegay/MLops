@@ -1,0 +1,31 @@
+{
+  "version": "v2",
+  "examples": 2292,
+  "system_prompts": 5,
+  "groups": 452,
+  "largest_group": "t0:bucket-098",
+  "largest_group_share": 0.0109,
+  "answer_len": {
+    "p10": 40,
+    "p50": 463,
+    "p90": 1732,
+    "ratio_p90_p10": 43.3,
+    "cv": 1.09,
+    "min": 2,
+    "max": 4618
+  },
+  "same_length_share": 0.0079,
+  "duplicate_answer_share": 0.0179,
+  "thresholds": {
+    "min_examples": 1000,
+    "min_system_prompts": 3,
+    "min_groups": 50,
+    "max_group_share": 0.1,
+    "min_answer_len_ratio": 1.6,
+    "max_same_length_share": 0.25,
+    "max_duplicate_answer_share": 0.3
+  },
+  "violations": [],
+  "passed": true,
+  "seconds": 0.14
+}

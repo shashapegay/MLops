@@ -1,293 +1,117 @@
-"""Schema -> length -> PII -> exact dedup -> near-dup dedup."""
+"""Стадия clean: валидация схемы, фильтр длин, чистка ПДн, дедупликация."""
 
 import json
+import sys
 import time
-
 from pathlib import Path
 
 from src.config import load_params
-
-from src.dedup import (
-    exact_duplicates,
-    near_duplicates,
-    near_duplicate_components,
-)
-
+from src.dedup import exact_duplicates, near_duplicates
 from src.pii import scrub
-
-from src.schema import (
-    dump,
-    iter_examples,
-)
-
+from src.schema import Example, dump, iter_examples
 from src.stats import percentile
-from src.textnorm import normalize_text
+from src.textnorm import normalize_group, normalize_text
 
 
-def percentiles(
-    values: list[int],
-) -> dict[str, int]:
-
+def percentiles(values: list[int]) -> dict[str, int]:
+    """Сводка длин для отчёта. Считается тем же модулем, что и гейт diversity:
+    иначе в datasheet окажется одно число, а в сообщении об ошибке другое."""
     return {
-        "p50": percentile(values, 0.5),
-        "p90": percentile(values, 0.9),
+        "p50": percentile(values, 0.50),
+        "p90": percentile(values, 0.90),
         "p99": percentile(values, 0.99),
-        "max": max(values)
-        if values
-        else 0,
+        "max": max(values) if values else 0,
     }
 
 
 def main() -> None:
-
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     params = load_params()
-
     cfg = params["clean"]
     paths = params["paths"]
-
     started = time.perf_counter()
 
-    examples = list(
-        iter_examples(
-            paths["raw"]
-        )
-    )
-
+    # 1. Валидация схемы. Битая строка — исключение с номером строки, стадия падает.
+    examples: list[Example] = list(iter_examples(paths["raw"]))
     rows_in = len(examples)
 
-    # ---------------------------------------------------------
-    # 1. Length filtering
-    # ---------------------------------------------------------
-
-    kept = []
+    # 2. Фильтр длин.
+    kept: list[Example] = []
     dropped_length = 0
-
     for ex in examples:
-
-        valid = (
-            cfg["min_user_chars"]
-            <= len(ex.user)
-            <= cfg["max_user_chars"]
-            and len(ex.assistant)
-            >= cfg["min_assistant_chars"]
-        )
-
-        if not valid:
+        user_len = len(ex.user)
+        if not (cfg["min_user_chars"] <= user_len <= cfg["max_user_chars"]):
             dropped_length += 1
+            continue
+        if len(ex.assistant) < cfg["min_assistant_chars"]:
+            dropped_length += 1
+            continue
+        kept.append(ex)
 
-        else:
-            kept.append(ex)
-
-    # ---------------------------------------------------------
-    # 2. PII
-    # ---------------------------------------------------------
-
-    pii_hits = {
-        "phone": 0,
-        "email": 0,
-        "birth_date": 0,
-    }
-
+    # 3. Чистка ПДн — по всем ролям, включая ответ ассистента.
+    pii_hits: dict[str, int] = {}
     pii_rows = 0
-
     if cfg["pii"]["enabled"]:
-
         for ex in kept:
-
             touched = False
-
             for msg in ex.messages:
-
-                msg.content, hits = scrub(
-                    msg.content
-                )
-
+                cleaned, hits = scrub(msg.content)
                 if hits:
-
+                    msg.content = cleaned
                     touched = True
+                    for name, count in hits.items():
+                        pii_hits[name] = pii_hits.get(name, 0) + count
+            pii_rows += touched
 
-                    for (
-                        name,
-                        count,
-                    ) in hits.items():
+    # 4. Точная дедупликация по нормализованному тексту вопроса.
+    keys = [normalize_text(ex.user) for ex in kept]
+    exact = set(exact_duplicates(keys))
+    kept = [ex for i, ex in enumerate(kept) if i not in exact]
 
-                        pii_hits[name] += count
-
-            pii_rows += int(touched)
-
-    # ---------------------------------------------------------
-    # 3. Exact dedup
-    # ---------------------------------------------------------
-
-    keys = [
-        normalize_text(ex.user)
-        for ex in kept
-    ]
-
-    exact = set(
-        exact_duplicates(keys)
-    )
-
-    kept = [
-        ex
-        for i, ex
-        in enumerate(kept)
-        if i not in exact
-    ]
-
-    # ---------------------------------------------------------
-    # 4. Near-duplicate dedup
-    # ---------------------------------------------------------
-
-    nd = cfg["near_dup"]
-
-    near = set()
-
-    if nd["enabled"] and kept:
-
-        texts = [
-            normalize_text(ex.user)
-            for ex in kept
-        ]
-
+    # 5. Near-duplicate дедупликация по тому же нормализованному вопросу.
+    # Она идёт после exact: дорогой MinHash работает только по остатку.
+    near: set[int] = set()
+    if cfg["near_dup"]["enabled"] and kept:
+        texts = [normalize_text(ex.user) for ex in kept]
         near = set(
             near_duplicates(
                 texts,
-                nd["shingle_words"],
-                nd["num_perm"],
-                nd["threshold"],
+                shingle_words=cfg["near_dup"]["shingle_words"],
+                num_perm=cfg["near_dup"]["num_perm"],
+                threshold=cfg["near_dup"]["threshold"],
             )
         )
+        kept = [ex for i, ex in enumerate(kept) if i not in near]
 
-        kept = [
-            ex
-            for i, ex
-            in enumerate(kept)
-            if i not in near
-        ]
-
-        # -----------------------------------------------------
-        # 5. Group construction
-        # -----------------------------------------------------
-
-        texts = [
-            normalize_text(ex.user)
-            for ex in kept
-        ]
-
-        groups = near_duplicate_components(
-            texts,
-            nd["shingle_words"],
-            nd["num_perm"],
-            nd["threshold"],
-        )
-
-        for ex, group in zip(
-            kept,
-            groups,
-        ):
-            ex.topic = group
-
-    else:
-
-        for i, ex in enumerate(kept):
-            ex.topic = f"row-{i:05d}"
-
-    # ---------------------------------------------------------
-    # Output
-    # ---------------------------------------------------------
-
-    out = Path(
-        paths["clean"]
-    )
-
-    out.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    with out.open(
-        "w",
-        encoding="utf-8",
-    ) as fh:
-
+    out = Path(paths["clean"])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as fh:
         for ex in kept:
-            fh.write(
-                dump(ex) + "\n"
-            )
+            fh.write(dump(ex) + "\n")
 
     metrics = {
-        "version":
-            params["collect"]["version"],
-
+        "version": params["collect"]["version"],
         "rows_in": rows_in,
         "rows_out": len(kept),
-
-        "dropped_length":
-            dropped_length,
-
-        "dropped_exact_dup":
-            len(exact),
-
-        "dropped_near_dup":
-            len(near),
-
-        "pii_rows_masked":
-            pii_rows,
-
-        "pii_hits":
-            pii_hits,
-
-        "groups":
-            len({ex.topic for ex in kept}),
-
-        "user_chars":
-            percentiles(
-                [len(ex.user) for ex in kept]
-            ),
-
-        "assistant_chars":
-            percentiles(
-                [
-                    len(ex.assistant)
-                    for ex in kept
-                ]
-            ),
-
-        "seconds":
-            round(
-                time.perf_counter()
-                - started,
-                2,
-            ),
+        "dropped_length": dropped_length,
+        "dropped_exact_dup": len(exact),
+        "dropped_near_dup": len(near),
+        "pii_rows_masked": pii_rows,
+        "pii_hits": {name: pii_hits.get(name, 0) for name in ("phone", "email", "birth_date")},
+        "groups": len({normalize_group(ex.topic) for ex in kept}),
+        "user_chars": percentiles([len(ex.user) for ex in kept]),
+        "assistant_chars": percentiles([len(ex.assistant) for ex in kept]),
+        "seconds": round(time.perf_counter() - started, 2),
     }
-
-    mpath = Path(
-        paths["metrics_clean"]
-    )
-
-    mpath.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    mpath.write_text(
-        json.dumps(
-            metrics,
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    mpath = Path(paths["metrics_clean"])
+    mpath.parent.mkdir(parents=True, exist_ok=True)
+    mpath.write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     print(
-        f"clean: {rows_in} -> "
-        f"{len(kept)}; "
-        f"length=-{dropped_length}, "
-        f"exact=-{len(exact)}, "
-        f"near=-{len(near)}, "
-        f"groups={metrics['groups']}"
+        f"clean: {rows_in} -> {len(kept)} строк "
+        f"(длина -{dropped_length}, точные -{len(exact)}, near-dup -{len(near)}), "
+        f"ПДн замаскировано в {pii_rows} строках, {metrics['seconds']} с"
     )
 
 

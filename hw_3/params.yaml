@@ -1,26 +1,34 @@
+# Единственная точка конфигурации ДЗ 3.
 collect:
-  version: "v1"
-
-  dataset: "Open-Orca/OpenOrca"
-  split: "train"
-
-  n_rows: 5000
-
-  seed_by_version:
-    v1: 42
-    v2: 2026
+  version: "v2"
+  n_rows: 2400
+  source:
+    dataset: "Open-Orca/OpenOrca"
+    config: "default"
+    split: "train"
+  # v2 расширяет v1: больше строк из того же источника.
+  offsets:
+    v1: 0
+    v2: 0
+  min_source_question_chars: 30
+  min_source_response_chars: 2
+  topic_buckets: 128
+  system_prompts:
+    - "You are an assistant. Answer the user's task clearly and accurately."
+    - "You are a helpful assistant. Follow the user's instructions and provide a useful answer."
+    - "Answer the task faithfully and concisely."
+    - "Help the user solve the task. Return the best supported answer."
+    - "Provide an accurate response to the task without unnecessary filler."
 
 clean:
   min_user_chars: 30
-  max_user_chars: 4000
+  max_user_chars: 6000
   min_assistant_chars: 2
-
   near_dup:
     enabled: true
     shingle_words: 4
     num_perm: 64
     threshold: 0.85
-
   pii:
     enabled: true
 
@@ -35,12 +43,10 @@ diversity:
 
 split:
   group_key: "topic"
-
   ratios:
     train: 0.8
     val: 0.1
     test: 0.1
-
   seed: 42
 
 contamination:
@@ -52,10 +58,9 @@ paths:
   train: "data/train.jsonl"
   val: "data/val.jsonl"
   test: "data/test.jsonl"
-
   metrics_collect: "metrics/collect.json"
   metrics_clean: "metrics/clean.json"
   metrics_split: "metrics/split.json"
   metrics_diversity: "metrics/diversity.json"
-
+  metrics_contamination: "metrics/contamination.json"
   datasheet: "docs/datasheet.md"

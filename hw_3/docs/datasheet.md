@@ -1,98 +1,130 @@
-# Datasheet — OpenOrca v1/v2
+# Datasheet — OpenOrca-derived chat dataset
 
-## Source
+## 1. Назначение
 
-- Dataset: `Open-Orca/OpenOrca`
-- URL: https://huggingface.co/datasets/Open-Orca/OpenOrca
-- Split: `train`
-- Sampling: streaming
-- Selection size: exactly 5000 source records before cleaning
-- Stratification key: `system_prompt`
+Набор предназначен для дообучения chat-модели на широком наборе
+англоязычных instruction/response задач. Тема набора: **general instruction
+following / reasoning** без попытки выдавать искусственные topic labels за
+семантическую разметку.
 
-## Source schema
+Источник — [Open-Orca/OpenOrca](https://huggingface.co/datasets/Open-Orca/OpenOrca).
+По карточке Hugging Face набор содержит преимущественно английские данные,
+представленные как `system_prompt`, `question`, `response`; текущий parquet
+экспорт имеет около 2.94 млн строк. Лицензия, указанная на странице набора,
+— MIT.
 
-The source records contain:
+## 2. Что считается «своим» датасетом
 
-- `id`
-- `system_prompt`
-- `question`
-- `response`
+Исходный OpenOrca не переносится в `raw.jsonl` как есть. Стадия `collect`
+делает воспроизводимую переработку:
 
-Mapping:
+1. берёт детерминированный срез `n_rows` через Dataset Viewer API;
+2. отбрасывает слишком короткие вопрос/ответ;
+3. переводит схему `system_prompt/question/response` в контракт курса
+   `id/topic/messages`;
+4. заменяет один исходный system prompt пятью детерминированно выбранными
+   инструкциями;
+5. строит стабильный `topic`-ключ для группового сплита: семейство id
+   (`flan`, `cot`, `t0`, `niv` и т.п.) + один из 128 лексических buckets
+   вопроса. Это **техническая группировка для split**, а не утверждение, что
+   bucket является истинной предметной темой.
 
-- `id` -> `id`
-- `system_prompt` -> `messages[0]`
-- `question` -> `messages[1]`
-- `response` -> `messages[2]`
+Поэтому `collect` — не простое скачивание и переименование чужого файла.
 
-## Sampling
+## 3. Версии
 
-The complete source is scanned once to count every
-`system_prompt` stratum.
+- **v1:** 1200 строк до очистки.
+- **v2:** 2400 строк до очистки; это расширение v1 тем же источником и
+  тем же преобразованием.
 
-Target counts are allocated proportionally
-using the largest-remainder method.
+Переключение выполняется `make v1` / `make v2`; DVC видит изменение всей
+секции `collect` в `params.yaml` и пересчитывает `collect` и downstream
+стадии.
 
-The sum of target counts is exactly 5000.
+После построения версии выполняется:
 
-A second streaming pass selects records within
-each stratum using a deterministic SHA-256 priority.
+```bash
+make diff
+```
 
-v1 uses seed 42.
+Для сдачи сохраняется вывод `dvc metrics diff` в истории команд/отчёте.
 
-v2 uses seed 2026.
+## 4. Контракт
 
-## Cleaning
+Каждая строка:
+
+```json
+{
+  "id": "...",
+  "topic": "...",
+  "messages": [
+    {"role": "system", "content": "..."},
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ]
+}
+```
+
+Схема валидируется до фильтрации. Битый JSONL или неверный набор ролей
+останавливает `clean` с номером строки.
+
+## 5. Очистка
+
+Порядок:
 
 1. schema validation;
-2. length filtering;
-3. PII masking;
-4. exact deduplication;
-5. near-duplicate deduplication.
+2. фильтр длины;
+3. маскирование email/телефона/даты рождения;
+4. exact dedup по нормализованному user-тексту;
+5. near-duplicate dedup через MinHash/LSH.
 
-Near-duplicate connected components are then used
-as split groups.
+Порог near-dup: Jaccard `0.85`, 4-словные shingles, 64 permutation.
+Тот же порог используется отдельной проверкой контаминации.
 
-## Split
+## 6. Разнообразие
 
-The cleaned dataset is divided approximately:
+Используются пороги из `params.yaml`:
 
-- train: 80%;
-- validation: 10%;
-- test: 10%.
+- ≥1000 примеров после clean;
+- ≥3 system prompts;
+- ≥50 групп;
+- крупнейшая группа ≤10%;
+- p90/p10 длины ответа ≥1.6;
+- одна и та же длина ≤25%;
+- дословные повторы ответа ≤30%.
 
-Groups are never intentionally divided between
-train and test.
+Нарушение любого порога завершает стадию `diversity` с ненулевым кодом.
 
-## Contamination
+## 7. Сплит
 
-The following intersections are checked:
+Сплит выполняется **по целым группам `topic`**, а не по отдельным строкам.
+Все строки одной нормализованной группы находятся только в одном из
+`train/val/test`.
 
-- id;
-- normalized question;
-- group;
-- near-duplicate pairs.
+После split запускается отдельная стадия `contamination`, которая проверяет:
 
-All four must be zero.
+- пересечение id;
+- пересечение нормализованного user-текста;
+- пересечение групп;
+- near-duplicate пары train↔test тем же порогом `0.85`.
 
-## Diversity
+Любое ненулевое пересечение — ошибка.
 
-The dataset must satisfy the configured:
+## 8. Ограничения и риски
 
-- minimum number of examples;
-- minimum number of system prompts;
-- minimum number of groups;
-- maximum group share;
-- answer-length diversity;
-- duplicate-answer share.
+- OpenOrca является широким англоязычным instruction dataset, поэтому
+  предметная специализация ограничена.
+- `topic` — технический группировочный ключ, а не ручная семантическая
+  классификация.
+- Содержимое ответов унаследовано от источника и не проверяется внешним
+  факт-чекером.
+- PII-гейт покрывает распространённые email/phone/birth-date паттерны, но
+  не является гарантией отсутствия всех видов персональных данных.
+- Dataset Viewer API обращается к актуальному состоянию набора; для полностью
+  воспроизводимого долгосрочного релиза следует дополнительно закрепить
+  revision источника.
 
-Any violation fails the pipeline.
+## 9. Лицензия
 
-## Limitations
-
-OpenOrca does not contain a native `topic` field.
-
-The homework-compatible `topic` field is therefore used
-as a technical group identifier after near-duplicate clustering.
-
-The selected 5000 records are a sample of the complete source.
+Карточка OpenOrca на Hugging Face указывает MIT. При использовании исходных
+примеров необходимо также соблюдать условия и атрибуцию исходного проекта.

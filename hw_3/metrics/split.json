@@ -1,0 +1,22 @@
+{
+  "version": "v2",
+  "seed": 42,
+  "group_key": "topic",
+  "groups_total": 452,
+  "sizes": {
+    "train": 1868,
+    "val": 207,
+    "test": 217
+  },
+  "groups": {
+    "train": 362,
+    "val": 45,
+    "test": 45
+  },
+  "ratios_actual": {
+    "train": 0.815,
+    "val": 0.0903,
+    "test": 0.0947
+  },
+  "seconds": 0.1
+}

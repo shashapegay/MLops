@@ -1,369 +1,141 @@
-"""OpenOrca -> ровно 5000 строк, стратифицированных по system_prompt."""
+"""Collect a reproducible slice of Open-Orca from the Hugging Face Dataset Viewer API.
 
+The source is intentionally treated as raw material.  We:
+* select a deterministic, configurable slice;
+* convert Open-Orca's system_prompt/question/response schema to the course chat schema;
+* diversify the system instruction;
+* derive a stable group key used only for honest splitting.
+
+No generated copy of Open-Orca is committed to git; the raw JSONL is a DVC output.
+"""
 import hashlib
 import json
+import re
 import time
-from collections import Counter, defaultdict
 from pathlib import Path
-
-from datasets import load_dataset
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from src.config import load_params
 
+API_BASE = "https://datasets-server.huggingface.co/rows"
+PAGE_SIZE = 100
 
-def source_stream(dataset_name: str, split: str):
-    return load_dataset(
-        dataset_name,
-        split=split,
-        streaming=True,
-    )
+STOPWORDS = {
+    "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "is", "are",
+    "was", "were", "be", "as", "by", "with", "from", "that", "this", "it", "what",
+    "which", "who", "how", "why", "when", "where", "do", "does", "did", "can",
+    "could", "would", "should", "please", "following", "given", "answer", "question",
+    "following", "select", "choose", "one",
+}
 
+def pick_prompt(example_id: str, variants: list[str]) -> str:
+    digest = hashlib.sha1(example_id.encode("utf-8")).hexdigest()
+    return variants[int(digest, 16) % len(variants)]
 
-def prompt_key(value) -> str:
-    return "" if value is None else str(value)
+def normalize_for_group(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
+def derive_topic(example_id: str, question: str, bucket_count: int) -> str:
+    """Stable, transparent grouping key, not a semantic ground-truth label.
 
-def allocate_targets(
-    counts: dict[str, int],
-    total: int,
-) -> dict[str, int]:
-    population = sum(counts.values())
+    Open-Orca does not provide a topic column.  We therefore form reproducible
+    lexical buckets from the question.  The source family plus a 128-way bucket
+    keeps groups sufficiently fine-grained for a group-wise split while avoiding
+    inventing semantic labels.
+    """
+    family = example_id.split(".", 1)[0].lower() or "unknown"
+    words = [w for w in normalize_for_group(question).split() if w not in STOPWORDS]
+    signature = " ".join(words[:8])
+    digest = hashlib.sha1(f"{family}|{signature}".encode("utf-8")).hexdigest()
+    bucket = int(digest, 16) % bucket_count
+    return f"{family}:bucket-{bucket:03d}"
 
-    if population < total:
-        raise RuntimeError(
-            f"источник содержит только {population} строк, "
-            f"нужно {total}"
-        )
-
-    raw = {
-        key: total * count / population
-        for key, count in counts.items()
+def fetch_rows(offset: int, length: int, source: dict) -> list[dict]:
+    params = {
+        "dataset": source["dataset"],
+        "config": source["config"],
+        "split": source["split"],
+        "offset": offset,
+        "length": length,
     }
-
-    targets = {
-        key: int(value)
-        for key, value in raw.items()
-    }
-
-    remaining = total - sum(targets.values())
-
-    order = sorted(
-        raw,
-        key=lambda key: (
-            raw[key] - targets[key],
-            key,
-        ),
-        reverse=True,
-    )
-
-    for key in order[:remaining]:
-        targets[key] += 1
-
-    return targets
-
-
-def priority(example_id: str, seed: int) -> int:
-    payload = f"{seed}\0{example_id}".encode("utf-8")
-
-    return int(
-        hashlib.sha256(payload).hexdigest(),
-        16,
-    )
-
-
-def stratified_sample(
-    dataset_name: str,
-    split: str,
-    targets: dict[str, int],
-    seed: int,
-):
-    """Детерминированный top-k внутри каждой страты."""
-
-    import heapq
-
-    heaps = defaultdict(list)
-
-    for row in source_stream(dataset_name, split):
-        prompt = prompt_key(
-            row.get("system_prompt")
-        )
-
-        k = targets.get(prompt, 0)
-
-        if k == 0:
-            continue
-
-        row_id = str(row["id"])
-
-        item = (
-            -priority(row_id, seed),
-            row_id,
-            row,
-        )
-
-        heap = heaps[prompt]
-
-        if len(heap) < k:
-            heapq.heappush(
-                heap,
-                item,
-            )
-
-        elif item[:2] > heap[0][:2]:
-            heapq.heapreplace(
-                heap,
-                item,
-            )
-
-    selected = []
-
-    for prompt, k in targets.items():
-
-        rows = [
-            item[2]
-            for item in heaps[prompt]
-        ]
-
-        if len(rows) != k:
-            raise RuntimeError(
-                f"stratum {prompt!r}: "
-                f"ожидалось {k}, "
-                f"получено {len(rows)}"
-            )
-
-        selected.extend(rows)
-
-    return selected
-
+    req = Request(f"{API_BASE}?{urlencode(params)}", headers={"User-Agent": "mlops26-hw3/1.0"})
+    with urlopen(req, timeout=60) as response:
+        payload = json.load(response)
+    return [item["row"] for item in payload.get("rows", [])]
 
 def main() -> None:
     params = load_params()
-
     cfg = params["collect"]
     paths = params["paths"]
+    variants = cfg["system_prompts"]
+    if not variants:
+        raise SystemExit("collect.system_prompts пуст")
+
+    target = int(cfg["n_rows"])
+    source = cfg["source"]
+    offset = int(cfg.get("offsets", {}).get(cfg["version"], 0))
+    bucket_count = int(cfg.get("topic_buckets", 128))
+    out = Path(paths["raw"])
+    out.parent.mkdir(parents=True, exist_ok=True)
 
     started = time.perf_counter()
+    scanned = written = dropped_short = 0
+    prompts_used: set[str] = set()
+    seen_ids: set[str] = set()
 
-    dataset_name = cfg["dataset"]
-    split = cfg["split"]
-    total = int(cfg["n_rows"])
+    with out.open("w", encoding="utf-8") as fh:
+        cursor = offset
+        while written < target:
+            rows = fetch_rows(cursor, PAGE_SIZE, source)
+            if not rows:
+                break
+            cursor += len(rows)
+            for row in rows:
+                scanned += 1
+                ex_id = str(row.get("id", "")).strip()
+                question = str(row.get("question", "")).strip()
+                response = str(row.get("response", "")).strip()
+                if not ex_id or ex_id in seen_ids or len(question) < cfg["min_source_question_chars"] or len(response) < cfg["min_source_response_chars"]:
+                    dropped_short += 1
+                    continue
+                seen_ids.add(ex_id)
+                prompt = pick_prompt(ex_id, variants)
+                prompts_used.add(prompt)
+                record = {
+                    "id": ex_id,
+                    "topic": derive_topic(ex_id, question, bucket_count),
+                    "messages": [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": question},
+                        {"role": "assistant", "content": response},
+                    ],
+                }
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                written += 1
+                if written >= target:
+                    break
 
-    seed = int(
-        cfg["seed_by_version"][
-            cfg["version"]
-        ]
-    )
-
-    # ---------------------------------------------------------
-    # PASS 1: считаем все system_prompt
-    # ---------------------------------------------------------
-
-    counts = Counter()
-    source_rows = 0
-
-    for row in source_stream(
-        dataset_name,
-        split,
-    ):
-        source_rows += 1
-
-        prompt = prompt_key(
-            row.get("system_prompt")
-        )
-
-        counts[prompt] += 1
-
-    # ---------------------------------------------------------
-    # Рассчитываем ровно 5000 элементов
-    # ---------------------------------------------------------
-
-    targets = allocate_targets(
-        dict(counts),
-        total,
-    )
-
-    # ---------------------------------------------------------
-    # PASS 2: выбираем элементы внутри каждой страты
-    # ---------------------------------------------------------
-
-    selected = stratified_sample(
-        dataset_name,
-        split,
-        targets,
-        seed,
-    )
-
-    selected.sort(
-        key=lambda row: str(row["id"])
-    )
-
-    # ---------------------------------------------------------
-    # OpenOrca -> chat JSONL
-    # ---------------------------------------------------------
-
-    out = Path(paths["raw"])
-    out.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    with out.open(
-        "w",
-        encoding="utf-8",
-    ) as fh:
-
-        for row in selected:
-
-            system_prompt = prompt_key(
-                row.get("system_prompt")
-            )
-
-            question = str(
-                row.get("question") or ""
-            ).strip()
-
-            response = str(
-                row.get("response") or ""
-            ).strip()
-
-            if (
-                not system_prompt
-                or not question
-                or not response
-            ):
-                raise RuntimeError(
-                    "пустое обязательное поле "
-                    f"у id={row.get('id')}"
-                )
-
-            record = {
-                "id": str(row["id"]),
-
-                # В OpenOrca topic отсутствует.
-                # Реальная группа будет рассчитана
-                # после near-duplicate clustering.
-                "topic": "openorca",
-
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": question,
-                    },
-                    {
-                        "role": "assistant",
-                        "content": response,
-                    },
-                ],
-            }
-
-            fh.write(
-                json.dumps(
-                    record,
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-
-    selected_counts = Counter(
-        prompt_key(
-            row.get("system_prompt")
-        )
-        for row in selected
-    )
-
-    source_dist = {
-        key: round(
-            value / source_rows,
-            8,
-        )
-        for key, value
-        in sorted(counts.items())
-    }
-
-    sample_dist = {
-        key: round(
-            value / total,
-            8,
-        )
-        for key, value
-        in sorted(selected_counts.items())
-    }
-
-    max_error = max(
-        abs(
-            source_dist[key]
-            - sample_dist.get(key, 0.0)
-        )
-        for key in source_dist
-    )
+    if written < target:
+        raise SystemExit(f"Open-Orca: удалось собрать только {written} из {target} строк")
 
     metrics = {
         "version": cfg["version"],
-        "dataset": dataset_name,
-        "split": split,
-        "source_rows": source_rows,
-        "rows_selected": len(selected),
-        "strata": len(counts),
-        "seed": seed,
-
-        "selection_method":
-            "proportional_largest_remainder + sha256 top-k",
-
-        "source_counts":
-            dict(sorted(counts.items())),
-
-        "target_counts":
-            dict(sorted(targets.items())),
-
-        "selected_counts":
-            dict(sorted(selected_counts.items())),
-
-        "source_distribution": source_dist,
-        "selected_distribution": sample_dist,
-
-        "max_absolute_share_error":
-            round(max_error, 8),
-
-        "seconds":
-            round(
-                time.perf_counter() - started,
-                2,
-            ),
+        "source": source,
+        "offset": offset,
+        "rows_scanned": scanned,
+        "rows_written": written,
+        "dropped_short_or_duplicate_id": dropped_short,
+        "system_prompt_variants": len(prompts_used),
+        "topic_buckets": bucket_count,
+        "seconds": round(time.perf_counter() - started, 2),
     }
-
-    mpath = Path(
-        paths["metrics_collect"]
-    )
-
-    mpath.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    mpath.write_text(
-        json.dumps(
-            metrics,
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    assert len(selected) == total
-
-    print(
-        f"collect: {dataset_name}, "
-        f"source={source_rows}, "
-        f"selected={len(selected)}, "
-        f"strata={len(counts)}, "
-        f"max_share_error={max_error:.8f}"
-    )
-
+    mpath = Path(paths["metrics_collect"])
+    mpath.parent.mkdir(parents=True, exist_ok=True)
+    mpath.write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"collect: {cfg['version']}, scanned={scanned}, written={written}, prompts={len(prompts_used)}, {metrics['seconds']} s")
 
 if __name__ == "__main__":
     main()

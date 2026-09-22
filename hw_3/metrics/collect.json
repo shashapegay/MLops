@@ -1,0 +1,15 @@
+{
+  "version": "v2",
+  "source": {
+    "dataset": "Open-Orca/OpenOrca",
+    "config": "default",
+    "split": "train"
+  },
+  "offset": 0,
+  "rows_scanned": 2419,
+  "rows_written": 2400,
+  "dropped_short_or_duplicate_id": 19,
+  "system_prompt_variants": 5,
+  "topic_buckets": 128,
+  "seconds": 42.05
+}
