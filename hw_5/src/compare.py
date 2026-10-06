@@ -18,18 +18,6 @@ from src.runtime import resolve_device, resolve_dtype
 
 
 def load_adapter_tokenizer(adapter_dir: Path):
-    """Токенизатор берём из самого адаптера.
-
-    Это делает папку adapter_* самодостаточной относительно токенизации:
-    на машине получателя не требуется знать, какой tokenizer/chat template
-    использовался при обучении.
-    """
-    tok_cfg = adapter_dir / "tokenizer_config.json"
-    if not tok_cfg.exists():
-        raise SystemExit(
-            f"{adapter_dir}: нет tokenizer_config.json — сначала пересохраните адаптер "
-            "исправленной версией src/train.py"
-        )
     return AutoTokenizer.from_pretrained(adapter_dir)
 
 
@@ -83,7 +71,7 @@ def main() -> None:
     lines = ["# Базовая модель против адаптера", "",
              f"Адаптер: `{adapter_dir}`. Генерация жадная, до {params['compare']['max_new_tokens']} токенов.", ""]
     for i, (p, b, a) in enumerate(zip(prompts, before, after), 1):
-        q = p.split("Вопрос:\n")[-1].split("\n\nВарианты")[0]
+        q = p.split("\n")[0]
         lines += [f"## {i}. {q}", "", "**База:**", "", f"> {b.replace(chr(10), ' / ')}", "",
                   "**Адаптер:**", "", f"> {a.replace(chr(10), ' / ')}", ""]
     Path(params["paths"]["compare"]).write_text("\n".join(lines), encoding="utf-8")

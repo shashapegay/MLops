@@ -39,6 +39,12 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
+    # На cuda одного сида мало: cuBLAS и cuDNN по умолчанию выбирают
+    # недетерминированные ядра, и кривые расходятся в третьем знаке.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)   # строго: иначе backward SDPA на cuda недетерминирован
 
 
 def allocated_bytes(device: torch.device) -> int:

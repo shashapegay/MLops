@@ -7,7 +7,7 @@
 обычно прячется, — где считается val loss, как копятся градиенты, что
 сохраняется рядом с адаптером.
 
-Что сохраняется в models/adapter_<variant>/: адаптер.
+Что сохраняется в models/adapter_<variant>/: адаптер, токенизатор и шаблон чата.
 В metrics/train_<variant>.json — кривые train/val loss, время, пиковая память,
 число обучаемых параметров, вес адаптера и отпечаток входов.
 """
@@ -31,13 +31,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedul
 
 from src.config import load_params
 from src.data import LABEL_PAD_ID, batches, load_split
-from src.runtime import (
-    allocated_bytes,
-    memory_metric,
-    resolve_device,
-    resolve_dtype,
-    set_seed,
-)
+from src.runtime import allocated_bytes, memory_metric, resolve_device, resolve_dtype, set_seed
 
 
 TRAIN_CODE = ("src/train.py", "src/data.py", "src/runtime.py", "src/config.py")
@@ -59,26 +53,17 @@ def inputs_fingerprint(params: dict) -> str:
 
 
 def lora_config(params: dict, n_layers: int, freeze_first: int) -> LoraConfig:
-    """Создать LoRA-конфигурацию.
-
-    Для freeze14 адаптеры физически не создаются на слоях 0..13.
-    Поэтому проверяемый список layers_to_transform начинается с 14,
-    а число обучаемых параметров действительно уменьшается примерно вдвое.
-    """
     cfg = params["lora"]
-    kwargs = dict(
+    return LoraConfig(
         r=cfg["r"],
         lora_alpha=cfg["alpha"],
         lora_dropout=cfg["dropout"],
         target_modules=cfg["target_modules"],
+        modules_to_save=cfg.get("modules_to_save"),
+        # Заморозка нижних слоёв: адаптеры только на слоях freeze_first..n_layers-1.
+        layers_to_transform=list(range(freeze_first, n_layers)) if freeze_first > 0 else None,
         task_type="CAUSAL_LM",
     )
-    if freeze_first:
-        if not 0 < freeze_first < n_layers:
-            raise ValueError(f"freeze_first={freeze_first} вне диапазона 1..{n_layers - 1}")
-        kwargs["layers_to_transform"] = list(range(freeze_first, n_layers))
-        kwargs["layers_pattern"] = "layers"
-    return LoraConfig(**kwargs)
 
 
 @torch.no_grad()
@@ -124,10 +109,7 @@ def main() -> None:
     tcfg = params["train"]
     max_steps = args.max_steps if args.max_steps is not None else tcfg.get("max_steps")
 
-    # Сид фиксируем ДО создания модели и LoRA-матриц.
-    # Иначе две одинаковые команды получают разные начальные B/A и кривые.
-    set_seed(tcfg["seed"])
-
+    set_seed(tcfg["seed"])   # до создания LoRA: от сида зависят инициализация A и dropout
     device = resolve_device(params["model"]["device"])
     dtype = resolve_dtype(params["model"]["dtype"])
 
@@ -144,26 +126,14 @@ def main() -> None:
         # Активации 28 слоёв не храним, а пересчитываем на обратном проходе:
         # памяти в разы меньше, шаг примерно на треть дольше.
         model.config.use_cache = False
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.enable_input_require_grads()
-
-    # Считаем baseline ДО добавления адаптера. На шаге 0 LoRA B нулевая,
-    # поэтому loss после get_peft_model будет тем же самым, но baseline
-    # должен быть явно измерен для отчёта и автоматической проверки.
-    examples = train_blob["examples"]
-    eval_bs = tcfg.get("eval_batch_size", tcfg["batch_size"])
-    base_val = evaluate(model, val_blob["examples"], pad_id, device, eval_bs)
-
-    model = get_peft_model(
-        model,
-        lora_config(params, n_layers, variant["freeze_first"]),
-    )
+    model = get_peft_model(model, lora_config(params, n_layers, variant["freeze_first"]))
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     model.train()
 
+    examples = train_blob["examples"]
     micro_per_epoch = math.ceil(len(examples) / tcfg["batch_size"])
     steps_per_epoch = math.ceil(micro_per_epoch / tcfg["grad_accum"])
     total_steps = steps_per_epoch * tcfg["epochs"]
@@ -178,8 +148,15 @@ def main() -> None:
         optimizer, max(1, int(total_steps * tcfg["warmup_ratio"])), total_steps
     )
 
+    eval_bs = tcfg.get("eval_batch_size", tcfg["batch_size"])
     curve_train: list[list[float]] = []
-    curve_val: list[list[float]] = [[0, round(base_val, 4)]]
+    curve_val: list[list[float]] = []
+    # Шаг 0: LoRA-матрица B инициализирована нулями, значит это loss базовой модели.
+    t0 = time.perf_counter()
+    base_val = round(evaluate(model, val_blob["examples"], pad_id, device, eval_bs), 4)
+    curve_val.append([0, base_val])
+    eval_seconds_base = time.perf_counter() - t0
+    print(f"  шаг 0: val {base_val:.4f} (базовая модель)")
     print(f"[{args.variant}] устройство {device}, обучаемых {trainable:,} из {total:,} "
           f"({trainable / total:.3%}); шагов {total_steps}")
 
@@ -209,17 +186,11 @@ def main() -> None:
                 break
             accum_loss = 0.0
             if step % tcfg["eval_every"] == 0 or step == total_steps:
-                eval_started = time.perf_counter()
-                val_loss = evaluate(
-                    model, val_blob["examples"], pad_id, device, eval_bs
-                )
-                eval_seconds += time.perf_counter() - eval_started
-                curve_val.append([step, round(val_loss, 4)])
-                peak = max(peak, allocated_bytes(device))
-                print(
-                    f"  шаг {step}/{total_steps}: "
-                    f"train {curve_train[-1][1]:.4f}, val {val_loss:.4f}"
-                )
+                t0 = time.perf_counter()
+                val = round(evaluate(model, val_blob["examples"], pad_id, device, eval_bs), 4)
+                eval_seconds += time.perf_counter() - t0
+                curve_val.append([step, val])
+                print(f"  шаг {step}/{total_steps}: train {curve_train[-1][1]:.4f}, val {val:.4f}")
             if step >= total_steps:
                 break
         if diverged or step >= total_steps:
@@ -229,9 +200,8 @@ def main() -> None:
     out_root = Path(args.out) if args.out else Path(params["paths"]["models"])
     adapter_dir = out_root / f"adapter_{args.variant}"
     model.save_pretrained(adapter_dir)
-    # Передаём вместе с адаптером токенизатор и его chat template:
-    # проверка 4 поднимает папку офлайн и не имеет права брать токенизатор
-    # из исходного проекта.
+    # Токенизатор и шаблон чата — рядом с адаптером: без них на чужой машине
+    # неизвестно, чем адаптер обучен, и офлайн его не поднять.
     tokenizer.save_pretrained(adapter_dir)
 
     tokens = sum(len(e["input_ids"]) for e in examples) * tcfg["epochs"]
@@ -254,7 +224,7 @@ def main() -> None:
         "curve_train": curve_train,
         "curve_val": curve_val,
         "seconds": round(seconds, 1),
-        "eval_seconds": round(eval_seconds, 1),
+        "eval_seconds": round(eval_seconds + eval_seconds_base, 1),
         "seconds_per_step": round(seconds / max(step, 1), 3),
         "train_tokens_per_sec": round(tokens * min(1.0, step / max(total_steps, 1)) / seconds, 1) if seconds else 0,
         "peak_memory_mb": round(peak / 1048576, 1),
